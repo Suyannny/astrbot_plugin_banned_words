@@ -1,0 +1,6 @@
+name: astrbot_plugin_banned_words
+display_name: 违禁词管理
+desc: 群聊违禁词管理插件，支持添加、删除、列出违禁词，并自动拦截包含违禁词的消息。支持主人管理、管理员加入违禁词的功能。因为是ai写的，没写配置文件，有些配置请自行查看README修改main
+version: v1.0.0
+author: Converted
+repo: https://github.com/AstrBotDevs/AstrBot
