@@ -1,10 +1,3 @@
-"""
-违禁词管理插件 - AstrBot 4.20.0 版本
-功能：群聊违禁词管理，支持添加、删除、列出违禁词，并自动拦截包含违禁词的机器人消息
-作者：Converted
-版本：1.0.0
-"""
-
 import json
 import os
 import re
@@ -15,769 +8,398 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-
 @register(
     "astrbot_plugin_banned_words",
     "Converted",
-    "群聊违禁词管理插件，支持添加、删除、列出违禁词，并自动拦截包含违禁词的消息",
-    "1.0.0",
-    "https://github.com/AstrBotDevs/AstrBot"
+    "指令违禁词管理插件，支持添加、删除、列出违禁词，并自动拦截包含违禁词的消息",
+    "1.4.0",
+    "https://github.com/Suyannny/astrbot_plugin_banned_words"
 )
 class BannedWordsPlugin(Star):
-    """违禁词管理插件主类
-    
-    功能特性：
-    - 违禁词管理：添加、删除、列出、清空违禁词
-    - 管理员授权：主人可授权普通用户管理违禁词
-    - 消息拦截：自动拦截包含违禁词的机器人消息
-    - 权限控制：主人拥有全部权限，授权管理员只能在指定群聊管理违禁词
-    - 配置持久化：支持通过配置文件管理主人、管理员和违禁词
-    """
-    
+    """违禁词管理插件主类"""
+
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        
-        # 获取数据存储目录
+
         self.data_dir = StarTools.get_data_dir()
         self.data_file = self.data_dir / "banned_words_data.json"
-        
-        # 初始化数据结构
-        # 违禁词字典：{group_id: [word1, word2, ...]}
+
         self.banned_words: Dict[str, List[str]] = {}
-        # 授权管理员字典：{user_id: [group_id1, group_id2, ...]}
+        self.global_banned_words: List[str] = []
         self.admin_users: Dict[str, List[str]] = {}
-        # 主人列表：拥有全部权限
         self.master_users: List[str] = []
-        # 主人和管理员是否豁免拦截（硬编码开关：True=豁免，False=连同主人一起拦截）
-        self.bypass_for_authorized = False  
-        # 拦截违禁词时是否发送提示（硬编码开关：True=发送提示，False=静默拦截不提示）
-        self.show_banned_warning = False  
         
-        # 从配置文件加载数据
+        self.force_master_id = str(self.config.get("force_master_id", "")).strip()
+        self.command_prefix = str(self.config.get("command_prefix", "/")).strip()
+        self.enable_prefix_trigger = self.config.get("enable_prefix_trigger", True)
+        
+        self.bypass_for_authorized = self.config.get("bypass_for_authorized", False)
+        self.show_banned_warning = self.config.get("show_banned_warning", False)
+        self.help_text = self.config.get("help_text", "")
+
         self._load_config()
-        
-        # 加载运行时数据
         self._load_data()
-    
+
+    def _get_prefix_display(self) -> str:
+        """获取用于显示的前缀（帮助文本中使用）"""
+        return self.command_prefix if self.enable_prefix_trigger else ""
+
+    def _parse_json_text(self, text) -> dict:
+        if isinstance(text, dict): return text
+        if not isinstance(text, str) or not text.strip(): return {}
+        try:
+            result = json.loads(text)
+            return result if isinstance(result, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
     def _load_config(self):
-        """从配置文件加载主人列表和管理员列表"""
-        # 加载主人列表
-        self.master_users = [str(uid) for uid in self.config.get("master_users", [])]
+        if self.force_master_id:
+            self.master_users = [self.force_master_id]
+        self.global_banned_words = [str(w) for w in self.config.get("global_banned_words", []) if isinstance(w, str)]
         
-        # ================== 强制写入最高管理员 ==================
-        FORCE_MASTER_ID = "123456789"
-        if FORCE_MASTER_ID not in self.master_users:
-            self.master_users.insert(0, FORCE_MASTER_ID)  # 插入到列表首位
-            logger.info(f"⚡ 已强制写入最高管理员: {FORCE_MASTER_ID}")
-        # =======================================================
-        
-        # 加载管理员列表（配置文件中的预设管理员）
-        config_admins = self.config.get("admin_users", {})
-        if not isinstance(config_admins, dict):
-            logger.warning("插件配置中的 admin_users 格式错误，应为 object(字典)，已忽略。正确格式: {\"用户ID\": [\"群号1\"]}")
-            config_admins = {}
-        for user_id, groups in config_admins.items():
-            user_id = str(user_id)
-            if user_id not in self.admin_users:
-                self.admin_users[user_id] = []
-            if not isinstance(groups, list):
-                logger.warning(f"管理员 {user_id} 的群号配置格式错误，应为 list(列表)，已忽略。")
-                continue
-            for group_id in groups:
-                group_id = str(group_id)
-                if group_id not in self.admin_users[user_id]:
-                    self.admin_users[user_id].append(group_id)
-                    
-        # 加载配置文件中的违禁词
-        config_banned_words = self.config.get("banned_words", {})
-        if not isinstance(config_banned_words, dict):
-            logger.warning("插件配置中的 banned_words 格式错误，应为 object(字典)，已忽略。")
-            config_banned_words = {}
+        config_banned_words = self._parse_json_text(self.config.get("group_banned_words", "{}"))
         for group_id, words in config_banned_words.items():
             group_id = str(group_id)
-            if group_id not in self.banned_words:
-                self.banned_words[group_id] = []
-            if not isinstance(words, list):
-                continue
+            if group_id not in self.banned_words: self.banned_words[group_id] = []
+            if not isinstance(words, list): continue
             for word in words:
-                if word not in self.banned_words[group_id]:
-                    self.banned_words[group_id].append(word)
+                if word not in self.banned_words[group_id]: self.banned_words[group_id].append(word)
+        logger.info(f"配置加载完成：主人 {len(self.master_users)} 人，全局违禁词 {len(self.global_banned_words)} 个")
 
-        logger.info(f"配置加载完成：主人 {len(self.master_users)} 人，管理员 {len(self.admin_users)} 人")
-    
     async def initialize(self):
-        """插件初始化方法"""
         logger.info("违禁词管理插件已加载")
-        logger.info(f"当前主人列表：{self.master_users}")
-        logger.info(f"当前管理员数量：{len(self.admin_users)}")
-        logger.info(f"已设置违禁词的群聊数量：{len(self.banned_words)}")
-    
+        trigger_mode = f"前缀触发({self.command_prefix})" if self.enable_prefix_trigger else "无前缀触发"
+        logger.info(f"指令触发模式：{trigger_mode}")
+
     def _load_data(self):
-        """从数据文件加载运行时数据"""
         try:
             if self.data_file.exists():
                 with open(self.data_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    
-                    # 加载违禁词（合并配置文件和数据文件）
-                    for group_id, words in data.get("banned_words", {}).items():
+                for group_id, words in data.get("banned_words", {}).items():
+                    group_id = str(group_id)
+                    if group_id not in self.banned_words: self.banned_words[group_id] = []
+                    for word in words:
+                        if word not in self.banned_words[group_id]: self.banned_words[group_id].append(word)
+                for user_id, groups in data.get("admin_users", {}).items():
+                    user_id = str(user_id)
+                    if user_id not in self.admin_users: self.admin_users[user_id] = []
+                    for group_id in groups:
                         group_id = str(group_id)
-                        if group_id not in self.banned_words:
-                            self.banned_words[group_id] = []
-                        for word in words:
-                            if word not in self.banned_words[group_id]:
-                                self.banned_words[group_id].append(word)
-                    
-                    # 加载管理员（合并配置文件和数据文件）
-                    for user_id, groups in data.get("admin_users", {}).items():
-                        user_id = str(user_id)
-                        if user_id not in self.admin_users:
-                            self.admin_users[user_id] = []
-                        for group_id in groups:
-                            group_id = str(group_id)
-                            if group_id not in self.admin_users[user_id]:
-                                self.admin_users[user_id].append(group_id)
-                    
-                    logger.info(f"已加载运行时数据")
+                        if group_id not in self.admin_users[user_id]: self.admin_users[user_id].append(group_id)
+                for uid in data.get("master_users", []):
+                    if str(uid) not in self.master_users: self.master_users.append(str(uid))
         except Exception as e:
             logger.error(f"加载运行时数据失败: {e}")
-    
+
     def _save_data(self):
-        """保存数据到文件"""
         try:
-            # 确保目录存在
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            
-            data = {
-                "banned_words": self.banned_words,
-                "admin_users": self.admin_users
-            }
+            data = {"banned_words": self.banned_words, "admin_users": self.admin_users, "master_users": self.master_users}
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.debug("数据保存成功")
         except Exception as e:
             logger.error(f"保存数据失败: {e}")
-    
+
     def _is_master(self, user_id: str) -> bool:
-        """检查用户是否为主人
-        
-        Args:
-            user_id: 用户ID
-            
-        Returns:
-            bool: 是否为主人
-        """
         return str(user_id) in [str(uid) for uid in self.master_users]
-    
+
     def _is_admin(self, user_id: str, group_id: str) -> bool:
-        """检查用户是否为指定群聊的管理员
-        
-        主人默认拥有所有群聊的管理员权限
-        
-        Args:
-            user_id: 用户ID
-            group_id: 群聊ID
-            
-        Returns:
-            bool: 是否为管理员
-        """
-        user_id = str(user_id)
-        group_id = str(group_id)
-        
-        # 主人默认拥有全部权限（主人即管理员）
-        if self._is_master(user_id):
-            return True
-        
-        # 检查是否为授权管理员
-        admin_groups = self.admin_users.get(user_id, [])
-        return group_id in [str(g) for g in admin_groups]
-    
+        if self._is_master(user_id): return True
+        return str(group_id) in [str(g) for g in self.admin_users.get(str(user_id), [])]
+
     def _check_banned_words(self, message: str, group_id: str) -> Optional[str]:
-        """检查消息是否包含违禁词
-        
-        Args:
-            message: 消息内容
-            group_id: 群聊ID
-            
-        Returns:
-            Optional[str]: 匹配到的违禁词，如果没有则返回None
-        """
-        group_id = str(group_id)
-        words = self.banned_words.get(group_id, [])
-        
-        for word in words:
-            # 不区分大小写匹配
-            if word.lower() in message.lower():
-                return word
+        for word in self.global_banned_words:
+            if word.lower() in message.lower(): return word
+        for word in self.banned_words.get(str(group_id), []):
+            if word.lower() in message.lower(): return word
         return None
 
     def _get_at_users(self, event: AstrMessageEvent) -> List[str]:
-        """兼容各种适配器获取被@的用户ID列表"""
-        # 1. 尝试调用 AstrBot 标准方法
         if hasattr(event, 'get_mentions') and callable(event.get_mentions):
             try:
                 mentions = event.get_mentions()
-                if mentions:
-                    return [str(m) for m in mentions]
-            except Exception:
-                pass
-
-        # 2. 尝试从底层数组解析 (兼容 OneBot 等字典或对象格式)
+                if mentions: return [str(m) for m in mentions]
+            except Exception: pass
         if hasattr(event, 'message') and isinstance(event.message, list):
             for seg in event.message:
                 try:
-                    if isinstance(seg, dict):
-                        if seg.get("type") == "at":
-                            qq = seg.get("data", {}).get("qq")
-                            if qq:
-                                return [str(qq)]
-                    elif hasattr(seg, 'type') and getattr(seg, 'type', '') == 'at':
+                    if isinstance(seg, dict) and seg.get("type") == "at":
+                        qq = seg.get("data", {}).get("qq")
+                        if qq: return [str(qq)]
+                    elif hasattr(seg, 'type') and getattr(seg, 'type', '') == "at":
                         data = getattr(seg, 'data', None)
-                        if isinstance(data, dict) and 'qq' in data:
-                            return [str(data['qq'])]
-                        elif hasattr(seg, 'qq'):
-                            return [str(seg.qq)]
-                except Exception:
-                    continue
-
-        # 3. 尝试从纯文本 CQ 码解析 (终极后备方案)
+                        if isinstance(data, dict) and 'qq' in data: return [str(data['qq'])]
+                        elif hasattr(seg, 'qq'): return [str(seg.qq)]
+                except Exception: continue
         if hasattr(event, 'message_str'):
             match = re.search(r'\[CQ:at,qq=(\d+)\]', event.message_str)
-            if match:
-                return [match.group(1)]
-
+            if match: return [match.group(1)]
         return []
 
-    def _parse_at_or_qq(self, event: AstrMessageEvent, message: str, command: str) -> Optional[str]:
-        """解析@用户或QQ号
-        
-        支持两种格式：
-        1. &指令 @用户
-        2. &指令 QQ号
-        
-        Args:
-            event: 消息事件
-            message: 消息内容
-            command: 指令名称
-            
-        Returns:
-            Optional[str]: 目标用户ID，解析失败返回None
-        """
-        # 移除指令前缀
-        params = message.replace(command, "").replace(command.lstrip('&'), "").strip()
-        
-        # 尝试获取@的用户（使用万能兼容方法）
-        mentions = self._get_at_users(event)
-        if mentions:
-            return mentions[0]
-        
-        # 尝试解析QQ号
-        parts = params.split()
-        if len(parts) >= 1 and parts[0].isdigit():
-            return parts[0]
-        return None
-    
-    def _parse_group_and_user(self, event: AstrMessageEvent, message: str, command: str) -> tuple:
-        """解析群号和用户ID
-        
-        支持两种格式：
-        1. &指令 @用户 - 使用当前群聊
-        2. &指令 群号 QQ号 - 指定群聊和用户
-        
-        Args:
-            event: 消息事件
-            message: 消息内容
-            command: 指令名称
-            
-        Returns:
-            tuple: (group_id, user_id) 或 (None, None)
-        """
-        # 移除指令前缀
-        params = message.replace(command, "").replace(command.lstrip('&'), "").strip()
-        current_group_id = str(event.get_group_id()) if event.get_group_id() else None
-        
-        # 尝试获取@的用户（使用万能兼容方法）
-        mentions = self._get_at_users(event)
-        if mentions:
-            return current_group_id, mentions[0]
-        
-        # 尝试解析群号 QQ号格式
-        parts = params.split()
-        if len(parts) >= 2:
-            try:
-                group_id = parts[0]
-                user_id = parts[1]
-                if group_id.isdigit() and user_id.isdigit():
-                    return group_id, user_id
-            except (ValueError, IndexError):
-                pass
-        
-        # 尝试解析单个QQ号（使用当前群聊）
-        if len(parts) == 1 and parts[0].isdigit():
-            return current_group_id, parts[0]
-            
-        return None, None
-    
-    # ==================== 消息拦截 ====================
-    
-    # 插件所有指令的完整列表，用于跳过违禁词检查
+    # ==================== 核心机制：消息拦截与指令分发 ====================
+
     COMMAND_LIST = [
         "添加违禁词", "删除违禁词", "违禁词列表", "清空违禁词",
         "授权管理员", "取消授权", "管理员列表",
-        "添加主人", "删除主人", "主人列表",
-        "违禁词帮助",
+        "添加主人", "删除主人", "主人列表", "违禁词帮助",
     ]
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1)
     async def on_group_message(self, event: AstrMessageEvent):
-        """监听群消息，拦截包含违禁词的消息
-        主人和管理员发送的消息不会被拦截
-        彻底销毁违禁词消息体，防止无前缀/正则等任何方式绕过
-        """
+        """最高优先级：拦截违禁词，但必须放行本插件的指令"""
         group_id = str(event.get_group_id())
         message = event.message_str.strip()
         sender_id = str(event.get_sender_id())
-        
-        # 主人和管理员不受限制（受硬编码开关控制）
-        if self.bypass_for_authorized and (self._is_master(sender_id) or self._is_admin(sender_id, group_id)):
-            return
 
-        # 剥离前缀，判断是否为本插件自身的指令，如果是则直接放行
-        # (如果不放行，接下来销毁消息体会导致本插件的指令也被废掉)
-        clean_msg = message.lstrip('/').lstrip('&')
-        if any(clean_msg.startswith(cmd) for cmd in self.COMMAND_LIST):
-            return
+        if self.bypass_for_authorized and (self._is_master(sender_id) or self._is_admin(sender_id, group_id)): return
 
-        # 检查违禁词
+        check_msg = message
+        if self.enable_prefix_trigger:
+            if check_msg.startswith(self.command_prefix):
+                check_msg = check_msg[len(self.command_prefix):].strip()
+            else:
+                check_msg = ""  # 开启了前缀但没带前缀，必定不是本插件指令，不用再匹配了
+
+        if any(check_msg.startswith(cmd) for cmd in self.COMMAND_LIST): return
+
         banned_word = self._check_banned_words(message, group_id)
         if banned_word:
             logger.info(f"用户 {sender_id} 在群 {group_id} 发送违禁词: {banned_word}")
-            
-            # ================== 终极修复：彻底摧毁消息体 ==================
-            # 1. 清空纯文本字段，直接干掉无前缀触发（如 LLM 对话、正则匹配插件）
             event.message_str = ""
-            # 2. 尝试清空消息段数组字段，防止某些高级插件直接读取底层数据绕过
-            if hasattr(event, 'message') and isinstance(event.message, list):
-                event.message.clear()
-            # ===============================================================
-            
-            # 根据开关决定是否发送提示
-            if self.show_banned_warning:
-                yield event.plain_result(f"⚠️ 您的消息包含违禁词「{banned_word}」，已被拦截。")
+            if hasattr(event, 'message') and isinstance(event.message, list): event.message.clear()
+            if self.show_banned_warning: yield event.plain_result(f"⚠️ 您的消息包含违禁词「{banned_word}」，已被拦截。")
             event.stop_event()
-            return
-            
-    # ==================== 违禁词管理指令 ====================
-    
-    @filter.command("添加违禁词")
-    async def add_banned_word(self, event: AstrMessageEvent):
-        """添加违禁词
-        
-        用法：&添加违禁词 <违禁词>
-        权限：主人或管理员
-        """
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
+    async def command_dispatcher(self, event: AstrMessageEvent):
+        """次高优先级：统一分发插件指令"""
+        message = event.message_str.strip()
+        check_msg = message
+
+        if self.enable_prefix_trigger:
+            if not check_msg.startswith(self.command_prefix): return
+            check_msg = check_msg[len(self.command_prefix):].strip()
+
+        matched_cmd = None
+        for cmd in self.COMMAND_LIST:
+            if check_msg.startswith(cmd):
+                matched_cmd = cmd
+                break
+
+        if not matched_cmd: return
+        param = check_msg[len(matched_cmd):].strip()
+
+        handler_map = {
+            "添加违禁词": self._handle_add_banned_word,
+            "删除违禁词": self._handle_remove_banned_word,
+            "违禁词列表": self._handle_list_banned_words,
+            "清空违禁词": self._handle_clear_banned_words,
+            "授权管理员": self._handle_authorize_admin,
+            "取消授权": self._handle_revoke_admin,
+            "管理员列表": self._handle_list_admins,
+            "添加主人": self._handle_add_master,
+            "删除主人": self._handle_remove_master,
+            "主人列表": self._handle_list_masters,
+            "违禁词帮助": self._handle_show_help,
+        }
+
+        handler = handler_map.get(matched_cmd)
+        if handler:
+            async for result in handler(event, param):
+                yield result
+
+    # ==================== 指令处理逻辑 ====================
+
+    async def _handle_add_banned_word(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
         group_id = str(event.get_group_id()) if event.get_group_id() else None
-        
-        if not group_id:
-            yield event.plain_result("❌ 此指令只能在群聊中使用")
-            return
-        
-        # 权限检查
-        if not self._is_admin(user_id, group_id):
-            yield event.plain_result("❌ 您没有权限执行此操作，请联系主人或管理员")
-            return
-        
-        # 解析参数（同时兼容带/和不带/的指令）
-        message = event.message_str.strip()
-        word = message.replace("/添加违禁词", "").replace("添加违禁词", "").replace("&添加违禁词", "").strip()
-        
-        if not word:
-            yield event.plain_result("❌ 请提供要添加的违禁词\n用法：/添加违禁词 <违禁词>")
-            return
-        
-        # 添加违禁词
-        if group_id not in self.banned_words:
-            self.banned_words[group_id] = []
-        
-        if word in self.banned_words[group_id]:
-            yield event.plain_result(f"❌ 违禁词「{word}」已存在")
-            return
-        
+        if not group_id: yield event.plain_result("❌ 此指令只能在群聊中使用"); return
+        if not self._is_admin(user_id, group_id): yield event.plain_result("❌ 您没有权限执行此操作"); return
+        word = param.strip()
+        if not word: yield event.plain_result(f"❌ 请提供要添加的违禁词\n用法：{self._get_prefix_display()}添加违禁词 <违禁词>"); return
+        if group_id not in self.banned_words: self.banned_words[group_id] = []
+        if word in self.banned_words[group_id]: yield event.plain_result(f"❌ 违禁词「{word}」已存在"); return
         self.banned_words[group_id].append(word)
         self._save_data()
-        
-        logger.info(f"用户 {user_id} 在群 {group_id} 添加违禁词: {word}")
         yield event.plain_result(f"✅ 已添加违禁词「{word}」\n当前群聊共有 {len(self.banned_words[group_id])} 个违禁词")
-    
-    @filter.command("删除违禁词")
-    async def remove_banned_word(self, event: AstrMessageEvent):
-        """删除违禁词
-        
-        用法：&删除违禁词 <违禁词>
-        权限：主人或管理员
-        """
+
+    async def _handle_remove_banned_word(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
         group_id = str(event.get_group_id()) if event.get_group_id() else None
-        
-        if not group_id:
-            yield event.plain_result("❌ 此指令只能在群聊中使用")
-            return
-        
-        # 权限检查
-        if not self._is_admin(user_id, group_id):
-            yield event.plain_result("❌ 您没有权限执行此操作，请联系主人或管理员")
-            return
-        
-        # 解析参数（同时兼容带/和不带/的指令）
-        message = event.message_str.strip()
-        word = message.replace("/删除违禁词", "").replace("删除违禁词", "").replace("&删除违禁词", "").strip()
-        
-        if not word:
-            yield event.plain_result("❌ 请提供要删除的违禁词\n用法：/删除违禁词 <违禁词>")
-            return
-        
-        # 删除违禁词
-        if group_id not in self.banned_words or word not in self.banned_words[group_id]:
-            yield event.plain_result(f"❌ 违禁词「{word}」不存在")
-            return
-        
+        if not group_id: yield event.plain_result("❌ 此指令只能在群聊中使用"); return
+        if not self._is_admin(user_id, group_id): yield event.plain_result("❌ 您没有权限执行此操作"); return
+        word = param.strip()
+        if not word: yield event.plain_result(f"❌ 请提供要删除的违禁词\n用法：{self._get_prefix_display()}删除违禁词 <违禁词>"); return
+        if group_id not in self.banned_words or word not in self.banned_words[group_id]: yield event.plain_result(f"❌ 违禁词「{word}」不存在"); return
         self.banned_words[group_id].remove(word)
-        if not self.banned_words[group_id]:
-            del self.banned_words[group_id]
+        if not self.banned_words[group_id]: del self.banned_words[group_id]
         self._save_data()
-        
-        logger.info(f"用户 {user_id} 在群 {group_id} 删除违禁词: {word}")
         yield event.plain_result(f"✅ 已删除违禁词「{word}」")
-    
-    @filter.command("违禁词列表")
-    async def list_banned_words(self, event: AstrMessageEvent):
-        """列出当前群聊的所有违禁词
-        
-        用法：&违禁词列表
-        权限：所有人
-        """
+
+    async def _handle_list_banned_words(self, event: AstrMessageEvent, param: str):
         group_id = str(event.get_group_id()) if event.get_group_id() else None
-        
-        if not group_id:
-            yield event.plain_result("❌ 此指令只能在群聊中使用")
-            return
-        
-        # 获取违禁词列表
+        if not group_id: yield event.plain_result("❌ 此指令只能在群聊中使用"); return
         words = self.banned_words.get(group_id, [])
-        
-        if not words:
-            yield event.plain_result("📋 当前群聊没有设置违禁词")
-            return
-        
-        # 格式化输出
-        word_list = "\n".join([f"  {i+1}. {word}" for i, word in enumerate(words)])
-        result = f"📋 当前群聊违禁词列表（共 {len(words)} 个）：\n{word_list}"
-        yield event.plain_result(result)
-    
-    @filter.command("清空违禁词")
-    async def clear_banned_words(self, event: AstrMessageEvent):
-        """清空当前群聊的所有违禁词
-        
-        用法：&清空违禁词
-        权限：主人或管理员
-        """
+        result_lines = []
+        if self.global_banned_words:
+            result_lines.append("🌍 【全局预设违禁词】：")
+            result_lines.extend([f" {i+1}. {w}" for i, w in enumerate(self.global_banned_words)])
+        if words:
+            if result_lines: result_lines.append("")
+            result_lines.append("💡 【本群专属违禁词】：")
+            result_lines.extend([f" {i+1}. {w}" for i, w in enumerate(words)])
+        if not result_lines: yield event.plain_result("📋 当前群聊没有设置违禁词"); return
+        yield event.plain_result(f"📋 违禁词列表：\n" + "\n".join(result_lines))
+
+    async def _handle_clear_banned_words(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
         group_id = str(event.get_group_id()) if event.get_group_id() else None
-        
-        if not group_id:
-            yield event.plain_result("❌ 此指令只能在群聊中使用")
-            return
-        
-        # 权限检查 - 主人和管理员都可以清空
-        if not self._is_admin(user_id, group_id):
-            yield event.plain_result("❌ 您没有权限执行此操作，请联系主人或管理员")
-            return
-        
-        # 清空违禁词
+        if not group_id: yield event.plain_result("❌ 此指令只能在群聊中使用"); return
+        if not self._is_admin(user_id, group_id): yield event.plain_result("❌ 您没有权限执行此操作"); return
         if group_id in self.banned_words:
             count = len(self.banned_words[group_id])
             del self.banned_words[group_id]
             self._save_data()
-            logger.info(f"用户 {user_id} 清空了群 {group_id} 的违禁词（共 {count} 个）")
-            yield event.plain_result(f"✅ 已清空当前群聊的所有违禁词（共 {count} 个）")
-        else:
-            yield event.plain_result("📋 当前群聊没有设置违禁词")
-    
-    # ==================== 管理员授权指令 ====================
-    
-    @filter.command("授权管理员")
-    async def authorize_admin(self, event: AstrMessageEvent):
-        """授权用户为管理员
-        用法：
-        1. &授权管理员 QQ号 - 授权用户为当前群聊的管理员
-        2. &授权管理员 群号 QQ号 - 授权用户为指定群聊的管理员
-        权限：仅主人
-        """
+            yield event.plain_result(f"✅ 已清空当前群聊的专属违禁词（共 {count} 个）\n提示：全局违禁词仍会生效")
+        else: yield event.plain_result("📋 当前群聊没有设置专属违禁词")
+
+    async def _handle_authorize_admin(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
-        # 权限检查 - 只有主人可以授权
-        if not self._is_master(user_id):
-            yield event.plain_result("❌ 只有主人可以执行此操作")
-            return
-
-        # 解析群号和QQ号（彻底移除@用户解析，仅支持纯数字）
-        message = event.message_str.strip()
-        params = message.replace("/授权管理员", "").replace("授权管理员", "").replace("&授权管理员", "").strip()
-        parts = params.split()
-        
+        if not self._is_master(user_id): yield event.plain_result("❌ 只有主人可以执行此操作"); return
         current_group_id = str(event.get_group_id()) if event.get_group_id() else None
-        target_user_id = None
-        group_id = None
+        target_user_id, group_id = None, None
         
-        # 格式1: &授权管理员 群号 QQ号
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            group_id = parts[0]
-            target_user_id = parts[1]
-        # 格式2: &授权管理员 QQ号 (使用当前群)
-        elif len(parts) == 1 and parts[0].isdigit():
-            group_id = current_group_id
-            target_user_id = parts[0]
-
-        if not group_id or not target_user_id:
-            yield event.plain_result("❌ 请提供正确的参数\n用法：\n &授权管理员 QQ号\n &授权管理员 群号 QQ号")
-            return
-
-        # 不能授权主人（主人已经是最高权限）
-        if self._is_master(target_user_id):
-            yield event.plain_result("⚠️ 该用户已是主人，无需授权")
-            return
-
-        # 添加授权
-        if target_user_id not in self.admin_users:
-            self.admin_users[target_user_id] = []
-        if group_id in self.admin_users[target_user_id]:
-            yield event.plain_result(f"⚠️ 用户 {target_user_id} 已是群 {group_id} 的管理员")
-            return
+        mentions = self._get_at_users(event)
+        if mentions: target_user_id, group_id = mentions[0], current_group_id
+        
+        if not target_user_id:
+            parts = param.split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit(): group_id, target_user_id = parts[0], parts[1]
+            elif len(parts) == 1 and parts[0].isdigit(): group_id, target_user_id = current_group_id, parts[0]
+            
+        if not group_id or not target_user_id: yield event.plain_result(f"❌ 请提供正确的参数\n用法：\n {self._get_prefix_display()}授权管理员 QQ号\n {self._get_prefix_display()}授权管理员 群号 QQ号"); return
+        if self._is_master(target_user_id): yield event.plain_result("⚠️ 该用户已是主人，无需授权"); return
+        if target_user_id not in self.admin_users: self.admin_users[target_user_id] = []
+        if group_id in self.admin_users[target_user_id]: yield event.plain_result(f"⚠️ 用户 {target_user_id} 已是群 {group_id} 的管理员"); return
         self.admin_users[target_user_id].append(group_id)
         self._save_data()
-        logger.info(f"主人 {user_id} 授权用户 {target_user_id} 为群 {group_id} 的管理员")
         yield event.plain_result(f"✅ 已授权用户 {target_user_id} 为群 {group_id} 的管理员")
-    
-    @filter.command("取消授权")
-    async def revoke_admin(self, event: AstrMessageEvent):
-        """取消用户的管理员授权
-        用法：
-        1. &取消授权 QQ号 - 取消用户在当前群聊的管理员授权
-        2. &取消授权 群号 QQ号 - 取消用户在指定群聊的管理员授权
-        权限：仅主人
-        """
+
+    async def _handle_revoke_admin(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
-        # 权限检查 - 只有主人可以取消授权
-        if not self._is_master(user_id):
-            yield event.plain_result("❌ 只有主人可以执行此操作")
-            return
-
-        # 解析群号和QQ号（彻底移除@用户解析，仅支持纯数字）
-        message = event.message_str.strip()
-        params = message.replace("/取消授权", "").replace("取消授权", "").replace("&取消授权", "").strip()
-        parts = params.split()
-        
+        if not self._is_master(user_id): yield event.plain_result("❌ 只有主人可以执行此操作"); return
         current_group_id = str(event.get_group_id()) if event.get_group_id() else None
-        target_user_id = None
-        group_id = None
+        target_user_id, group_id = None, None
         
-        # 格式1: &取消授权 群号 QQ号
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            group_id = parts[0]
-            target_user_id = parts[1]
-        # 格式2: &取消授权 QQ号 (使用当前群)
-        elif len(parts) == 1 and parts[0].isdigit():
-            group_id = current_group_id
-            target_user_id = parts[0]
-
-        if not group_id or not target_user_id:
-            yield event.plain_result("❌ 请提供正确的参数\n用法：\n &取消授权 QQ号\n &取消授权 群号 QQ号")
-            return
-
-        # 取消授权
-        if target_user_id not in self.admin_users or group_id not in self.admin_users[target_user_id]:
-            yield event.plain_result(f"⚠️ 用户 {target_user_id} 不是群 {group_id} 的管理员")
-            return
+        mentions = self._get_at_users(event)
+        if mentions: target_user_id, group_id = mentions[0], current_group_id
+        
+        if not target_user_id:
+            parts = param.split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit(): group_id, target_user_id = parts[0], parts[1]
+            elif len(parts) == 1 and parts[0].isdigit(): group_id, target_user_id = current_group_id, parts[0]
+            
+        if not group_id or not target_user_id: yield event.plain_result(f"❌ 请提供正确的参数\n用法：\n {self._get_prefix_display()}取消授权 QQ号\n {self._get_prefix_display()}取消授权 群号 QQ号"); return
+        if target_user_id not in self.admin_users or group_id not in self.admin_users[target_user_id]: yield event.plain_result(f"⚠️ 用户 {target_user_id} 不是群 {group_id} 的管理员"); return
         self.admin_users[target_user_id].remove(group_id)
-        if not self.admin_users[target_user_id]:
-            del self.admin_users[target_user_id]
+        if not self.admin_users[target_user_id]: del self.admin_users[target_user_id]
         self._save_data()
-        logger.info(f"主人 {user_id} 取消了用户 {target_user_id} 在群 {group_id} 的管理员授权")
         yield event.plain_result(f"✅ 已取消用户 {target_user_id} 在群 {group_id} 的管理员授权")
-    
-    @filter.command("管理员列表")
-    async def list_admins(self, event: AstrMessageEvent):
-        """列出当前群聊的管理员
-        
-        用法：&管理员列表
-        权限：所有人
-        """
+
+    async def _handle_list_admins(self, event: AstrMessageEvent, param: str):
         group_id = str(event.get_group_id()) if event.get_group_id() else None
-        
-        if not group_id:
-            yield event.plain_result("❌ 此指令只能在群聊中使用")
-            return
-        
-        # 获取管理员列表
-        admins = []
-        for admin_id, groups in self.admin_users.items():
-            if group_id in [str(g) for g in groups]:
-                admins.append(admin_id)
-        
-        # 获取主人列表（主人在所有群都是管理员）
+        if not group_id: yield event.plain_result("❌ 此指令只能在群聊中使用"); return
+        admins = [admin_id for admin_id, groups in self.admin_users.items() if group_id in [str(g) for g in groups]]
         masters_in_group = self.master_users.copy()
-        
-        if not admins and not masters_in_group:
-            yield event.plain_result("📋 当前群聊没有授权管理员\n提示：主人默认拥有所有群聊的管理权限")
-            return
-        
-        # 格式化输出
+        if not admins and not masters_in_group: yield event.plain_result("📋 当前群聊没有授权管理员\n提示：主人默认拥有所有群聊的管理权限"); return
         result_lines = [f"📋 当前群聊管理员列表："]
-        
         if masters_in_group:
             result_lines.append("\n👑 主人（拥有全部权限）：")
-            for i, master_id in enumerate(masters_in_group):
-                result_lines.append(f"  {i+1}. {master_id}")
-        
+            for i, master_id in enumerate(masters_in_group): result_lines.append(f" {i+1}. {master_id}")
         if admins:
             result_lines.append(f"\n🔧 授权管理员（共 {len(admins)} 人）：")
-            for i, admin_id in enumerate(admins):
-                result_lines.append(f"  {i+1}. {admin_id}")
-        
+            for i, admin_id in enumerate(admins): result_lines.append(f" {i+1}. {admin_id}")
         yield event.plain_result("\n".join(result_lines))
-    
-    # ==================== 主人管理指令 ====================
-    
-    @filter.command("添加主人")
-    async def add_master(self, event: AstrMessageEvent):
-        """添加主人 用法：&添加主人 QQ号 权限：仅主人 """
+
+    async def _handle_add_master(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
-        # 权限检查 - 只有主人可以添加主人
-        if not self._is_master(user_id):
-            yield event.plain_result("❌ 只有主人可以执行此操作")
-            return
-
-        # 直接提取 QQ 号，不再支持 @用户
-        message = event.message_str.strip()
-        params = message.replace("/添加主人", "").replace("添加主人", "").replace("&添加主人", "").strip()
-        parts = params.split()
+        if not self._is_master(user_id): yield event.plain_result("❌ 只有主人可以执行此操作"); return
+        parts = param.split()
         target_user_id = parts[0] if len(parts) >= 1 and parts[0].isdigit() else None
-
-        if not target_user_id:
-            yield event.plain_result("❌ 请提供要添加的主人QQ号\n用法：&添加主人 QQ号")
-            return
-
-        # 检查是否已是主人
-        if self._is_master(target_user_id):
-            yield event.plain_result(f"⚠️ 用户 {target_user_id} 已是主人")
-            return
-
-        # 添加主人
+        if not target_user_id: yield event.plain_result(f"❌ 请提供要添加的主人QQ号\n用法：{self._get_prefix_display()}添加主人 QQ号"); return
+        if self._is_master(target_user_id): yield event.plain_result(f"⚠️ 用户 {target_user_id} 已是主人"); return
         self.master_users.append(target_user_id)
         self._save_data()
-        logger.info(f"主人 {user_id} 添加了新主人: {target_user_id}")
         yield event.plain_result(f"✅ 已添加用户 {target_user_id} 为主人")
-    
-    @filter.command("删除主人")
-    async def remove_master(self, event: AstrMessageEvent):
-        """删除主人 用法：&删除主人 QQ号 权限：仅主人 注意：至少保留一个主人 """
+
+    async def _handle_remove_master(self, event: AstrMessageEvent, param: str):
         user_id = str(event.get_sender_id())
-        # 权限检查 - 只有主人可以删除主人
-        if not self._is_master(user_id):
-            yield event.plain_result("❌ 只有主人可以执行此操作")
-            return
-
-        # 直接提取 QQ 号，不再支持 @用户
-        message = event.message_str.strip()
-        params = message.replace("/删除主人", "").replace("删除主人", "").replace("&删除主人", "").strip()
-        parts = params.split()
+        if not self._is_master(user_id): yield event.plain_result("❌ 只有主人可以执行此操作"); return
+        parts = param.split()
         target_user_id = parts[0] if len(parts) >= 1 and parts[0].isdigit() else None
-
-        if not target_user_id:
-            yield event.plain_result("❌ 请提供要删除的主人QQ号\n用法：&删除主人 QQ号")
-            return
-
-        # 检查是否是主人
-        if not self._is_master(target_user_id):
-            yield event.plain_result(f"⚠️ 用户 {target_user_id} 不是主人")
-            return
-
-        # 至少保留一个主人
-        if len(self.master_users) <= 1:
-            yield event.plain_result("❌ 至少需要保留一个主人")
-            return
-
-        # 删除主人
+        if not target_user_id: yield event.plain_result(f"❌ 请提供要删除的主人QQ号\n用法：{self._get_prefix_display()}删除主人 QQ号"); return
+        if not self._is_master(target_user_id): yield event.plain_result(f"⚠️ 用户 {target_user_id} 不是主人"); return
+        if self.force_master_id and str(target_user_id) == self.force_master_id: 
+            yield event.plain_result("❌ 无法删除在配置中强制设定的最高权限主人！请去WebUI配置中修改。"); return
+        if len(self.master_users) <= 1: yield event.plain_result("❌ 至少需要保留一个主人"); return
         self.master_users = [uid for uid in self.master_users if str(uid) != target_user_id]
         self._save_data()
-        logger.info(f"主人 {user_id} 删除了主人: {target_user_id}")
         yield event.plain_result(f"✅ 已删除主人 {target_user_id}")
-    
-    @filter.command("主人列表")
-    async def list_masters(self, event: AstrMessageEvent):
-        """列出所有主人
-        
-        用法：&主人列表
-        权限：所有人
-        """
-        if not self.master_users:
-            yield event.plain_result("📋 当前没有设置主人\n请在配置文件中添加主人QQ号")
+
+    async def _handle_list_masters(self, event: AstrMessageEvent, param: str):
+        if not self.master_users: yield event.plain_result("📋 当前没有设置主人"); return
+        master_list = "\n".join([f" {i+1}. {master_id}" for i, master_id in enumerate(self.master_users)])
+        yield event.plain_result(f"👑 主人列表（共 {len(self.master_users)} 人）：\n{master_list}")
+
+    async def _handle_show_help(self, event: AstrMessageEvent, param: str):
+        prefix = self._get_prefix_display()
+        if self.help_text:
+            yield event.plain_result(self.help_text.replace("{prefix}", prefix))
             return
-        
-        # 格式化输出
-        master_list = "\n".join([f"  {i+1}. {master_id}" for i, master_id in enumerate(self.master_users)])
-        result = f"👑 主人列表（共 {len(self.master_users)} 人）：\n{master_list}"
-        yield event.plain_result(result)
-    
-    # ==================== 帮助指令 ====================
-    
-    @filter.command("违禁词帮助")
-    async def show_help(self, event: AstrMessageEvent):
-        """显示违禁词插件帮助信息
-        
-        用法：&违禁词帮助
-        权限：所有人
-        """
-        help_text = """📖 违禁词管理插件帮助
+        bypass_status = "不会被拦截" if self.bypass_for_authorized else "同样会被拦截"
+        warning_status = "会发送提示" if self.show_banned_warning else "静默拦截"
+        help_text = f"""📖 违禁词管理插件帮助
 
 ═══════════════════════════
 【违禁词管理】
 ═══════════════════════════
-  &添加违禁词 <词> - 添加违禁词
-  &删除违禁词 <词> - 删除违禁词
-  &违禁词列表 - 查看违禁词列表
-  &清空违禁词 - 清空所有违禁词
+{prefix}添加违禁词 <词> - 添加当前群违禁词
+{prefix}删除违禁词 <词> - 删除当前群违禁词
+{prefix}违禁词列表 - 查看违禁词列表(含全局)
+{prefix}清空违禁词 - 清空当前群专属违禁词
+
 ═══════════════════════════
 【管理员授权】（仅主人可用）
 ═══════════════════════════
-  &授权管理员 群号 QQ号 - 授权指定群管理员
-  &取消授权 群号 QQ号 - 取消指定群授权
-  &管理员列表 - 查看管理员列表
+{prefix}授权管理员 群号 QQ号 - 授权指定群管理员
+{prefix}取消授权 群号 QQ号 - 取消指定群授权
+{prefix}管理员列表 - 查看管理员列表
+
 ═══════════════════════════
 【主人管理】（仅主人可用）
 ═══════════════════════════
-  &添加主人 QQ号 - 添加新主人
-  &删除主人 QQ号 - 删除主人
-  &主人列表 - 查看主人列表
+{prefix}添加主人 QQ号 - 添加新主人
+{prefix}删除主人 QQ号 - 删除普通主人
+{prefix}主人列表 - 查看主人列表
+
 ═══════════════════════════
-【权限说明】
+【权限与机制说明】
 ═══════════════════════════
-  • 主人：拥有全部权限，默认为所有群的管理员
-  • 管理员：只能管理被授权群聊的违禁词
-  • 主人和管理员发送的消息不会被拦截
+• 违禁词分为“全局预设”和“单群专属”，均会生效
+• 管理员只能管理被授权群聊的违禁词
+• 主人和管理员发送的消息{bypass_status}
+• 当前触发模式：{'需要前缀 ' + prefix if self.enable_prefix_trigger else '无前缀直接触发'}
+
 ═══════════════════════════
-【配置文件】
+【当前配置状态】
 ═══════════════════════════
-  可通过配置文件预设：
-  • master_users: 主人QQ号列表
-  • admin_users: 管理员配置
-  • banned_words: 违禁词配置"""
-        
+• 豁免开关：{'已开启' if self.bypass_for_authorized else '已关闭'}
+• 拦截提示：{'已开启' if self.show_banned_warning else '已关闭'}（{warning_status}）"""
         yield event.plain_result(help_text)
-    
+
     async def terminate(self):
-        """插件销毁方法"""
-        # 保存数据
         self._save_data()
         logger.info("违禁词管理插件已卸载")
