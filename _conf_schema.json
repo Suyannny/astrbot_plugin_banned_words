@@ -1,0 +1,50 @@
+{
+  "force_master_id": {
+    "type": "string",
+    "description": "强制设定的最高权限主人QQ号",
+    "hint": "请填写你的纯数字QQ号，例如 \"123456789\"。留空则不强制设定。",
+    "default": ""
+  },
+  "command_prefix": {
+    "type": "string",
+    "description": "插件专属指令前缀",
+    "hint": "仅在“开启前缀触发”时有效。例如填 / 则使用 /添加违禁词，填 # 则使用 #添加违禁词",
+    "default": "/"
+  },
+  "enable_prefix_trigger": {
+    "type": "bool",
+    "description": "是否开启前缀触发",
+    "hint": "开启=需要输入上方配置的前缀才可触发（如 /添加违禁词），关闭=无需前缀直接输入指令名即可触发（如 添加违禁词）",
+    "default": true
+  },
+  "global_banned_words": {
+    "type": "list",
+    "description": "全群预设违禁词（对所有群聊生效）",
+    "hint": "直接在列表中添加违禁词即可，对所有群聊生效。",
+    "default": []
+  },
+  "group_banned_words": {
+    "type": "text",
+    "description": "单群预设违禁词配置（JSON格式，按群号分组）",
+    "hint": "格式：{\"群号\": [\"违禁词1\", \"违禁词2\"]}，例如：{\"12345678\": [\"敏感词\", \"违禁词\"]}，留空表示无预设",
+    "default": "{}"
+  },
+  "bypass_for_authorized": {
+    "type": "bool",
+    "description": "主人和管理员是否豁免违禁词检查",
+    "hint": "开启=主人和管理员发送违禁词不会被拦截，关闭=主人和管理员同样会被拦截",
+    "default": false
+  },
+  "show_banned_warning": {
+    "type": "bool",
+    "description": "拦截违禁词时是否发送提示消息",
+    "hint": "开启=发送提示消息告知用户，关闭=静默拦截不提示",
+    "default": false
+  },
+  "help_text": {
+    "type": "text",
+    "description": "自定义帮助文本（留空使用默认帮助）",
+    "hint": "可使用 {prefix} 作为前缀占位符，会自动替换为当前前缀（关闭前缀触发时为空）。支持多行输入。",
+    "default": ""
+  }
+}
